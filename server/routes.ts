@@ -1,16 +1,473 @@
-import type { Express } from "express";
+import type { Express, Request, Response } from "express";
 import { createServer, type Server } from "http";
+import { WebSocketServer, WebSocket } from "ws";
+import session from "express-session";
 import { storage } from "./storage";
+import { 
+  insertUserSchema, insertReaderSchema, insertSessionSchema,
+  insertMessageSchema, insertReviewSchema, insertProductSchema,
+  insertOrderSchema, insertFavoriteSchema
+} from "@shared/schema";
+import { z } from "zod";
+import { scrypt, randomBytes, timingSafeEqual } from "crypto";
+import { promisify } from "util";
+
+const scryptAsync = promisify(scrypt);
+
+async function hashPassword(password: string): Promise<string> {
+  const salt = randomBytes(16).toString("hex");
+  const buf = (await scryptAsync(password, salt, 64)) as Buffer;
+  return `${buf.toString("hex")}.${salt}`;
+}
+
+async function comparePassword(supplied: string, stored: string): Promise<boolean> {
+  const [hashedPassword, salt] = stored.split(".");
+  const hashedBuf = Buffer.from(hashedPassword, "hex");
+  const suppliedBuf = (await scryptAsync(supplied, salt, 64)) as Buffer;
+  return timingSafeEqual(hashedBuf, suppliedBuf);
+}
+
+declare module "express-session" {
+  interface SessionData {
+    userId?: string;
+  }
+}
+
+const activeSessions = new Map<string, Set<WebSocket>>();
 
 export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
-  // put application routes here
-  // prefix all routes with /api
+  app.use(
+    session({
+      secret: process.env.SESSION_SECRET || "soulseer-secret-key-change-in-production",
+      resave: false,
+      saveUninitialized: false,
+      cookie: {
+        secure: process.env.NODE_ENV === "production",
+        httpOnly: true,
+        maxAge: 7 * 24 * 60 * 60 * 1000,
+      },
+    })
+  );
 
-  // use storage to perform CRUD operations on the storage interface
-  // e.g. storage.insertUser(user) or storage.getUserByUsername(username)
+  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+
+  wss.on("connection", (ws) => {
+    let currentSessionId: string | null = null;
+
+    ws.on("message", (data) => {
+      try {
+        const message = JSON.parse(data.toString());
+        if (message.type === "join" && message.sessionId) {
+          currentSessionId = message.sessionId;
+          if (!activeSessions.has(currentSessionId)) {
+            activeSessions.set(currentSessionId, new Set());
+          }
+          activeSessions.get(currentSessionId)!.add(ws);
+        }
+      } catch (error) {
+        console.error("WebSocket message error:", error);
+      }
+    });
+
+    ws.on("close", () => {
+      if (currentSessionId && activeSessions.has(currentSessionId)) {
+        activeSessions.get(currentSessionId)!.delete(ws);
+        if (activeSessions.get(currentSessionId)!.size === 0) {
+          activeSessions.delete(currentSessionId);
+        }
+      }
+    });
+  });
+
+  const broadcastToSession = (sessionId: string, message: object) => {
+    const clients = activeSessions.get(sessionId);
+    if (clients) {
+      const data = JSON.stringify(message);
+      clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(data);
+        }
+      });
+    }
+  };
+
+  const requireAuth = (req: Request, res: Response, next: Function) => {
+    if (!req.session.userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+    next();
+  };
+
+  const requireAdmin = async (req: Request, res: Response, next: Function) => {
+    if (!req.session.userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+    const user = await storage.getUser(req.session.userId);
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+    next();
+  };
+
+  app.post("/api/auth/register", async (req, res) => {
+    try {
+      const data = insertUserSchema.parse(req.body);
+      
+      const existingEmail = await storage.getUserByEmail(data.email);
+      if (existingEmail) {
+        return res.status(400).json({ message: "Email already registered" });
+      }
+
+      const existingUsername = await storage.getUserByUsername(data.username);
+      if (existingUsername) {
+        return res.status(400).json({ message: "Username already taken" });
+      }
+
+      const hashedPassword = await hashPassword(data.password);
+      const user = await storage.createUser({
+        ...data,
+        password: hashedPassword,
+      });
+
+      req.session.userId = user.id;
+      res.json({ user: { ...user, password: undefined } });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors[0].message });
+      }
+      res.status(500).json({ message: "Registration failed" });
+    }
+  });
+
+  app.post("/api/auth/login", async (req, res) => {
+    try {
+      const { email, password } = req.body;
+
+      const user = await storage.getUserByEmail(email);
+      if (!user) {
+        return res.status(401).json({ message: "Invalid credentials" });
+      }
+
+      const isValid = await comparePassword(password, user.password);
+      if (!isValid) {
+        return res.status(401).json({ message: "Invalid credentials" });
+      }
+
+      req.session.userId = user.id;
+      const reader = await storage.getReaderByUserId(user.id);
+      res.json({ user: { ...user, password: undefined }, reader });
+    } catch (error) {
+      res.status(500).json({ message: "Login failed" });
+    }
+  });
+
+  app.post("/api/auth/logout", (req, res) => {
+    req.session.destroy(() => {
+      res.json({ success: true });
+    });
+  });
+
+  app.get("/api/auth/me", async (req, res) => {
+    if (!req.session.userId) {
+      return res.status(401).json({ message: "Not authenticated" });
+    }
+
+    const user = await storage.getUser(req.session.userId);
+    if (!user) {
+      return res.status(401).json({ message: "User not found" });
+    }
+
+    const reader = await storage.getReaderByUserId(user.id);
+    res.json({ user: { ...user, password: undefined }, reader });
+  });
+
+  app.get("/api/readers", async (req, res) => {
+    const readers = await storage.getApprovedReaders();
+    res.json(readers);
+  });
+
+  app.get("/api/readers/:id", async (req, res) => {
+    const reader = await storage.getReader(req.params.id);
+    if (!reader) {
+      return res.status(404).json({ message: "Reader not found" });
+    }
+    res.json(reader);
+  });
+
+  app.get("/api/readers/:id/reviews", async (req, res) => {
+    const reviews = await storage.getReviewsByReader(req.params.id);
+    res.json(reviews);
+  });
+
+  app.patch("/api/readers/:id/status", requireAuth, async (req, res) => {
+    const reader = await storage.getReader(req.params.id);
+    if (!reader) {
+      return res.status(404).json({ message: "Reader not found" });
+    }
+
+    const user = await storage.getUser(req.session.userId!);
+    if (!user || (reader.userId !== user.id && user.role !== "admin")) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const updated = await storage.updateReader(req.params.id, {
+      isOnline: req.body.isOnline,
+    });
+    res.json(updated);
+  });
+
+  app.patch("/api/readers/:id/rates", requireAuth, async (req, res) => {
+    const reader = await storage.getReader(req.params.id);
+    if (!reader) {
+      return res.status(404).json({ message: "Reader not found" });
+    }
+
+    const user = await storage.getUser(req.session.userId!);
+    if (!user || reader.userId !== user.id) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const updated = await storage.updateReader(req.params.id, {
+      chatRate: req.body.chatRate,
+      voiceRate: req.body.voiceRate,
+      videoRate: req.body.videoRate,
+    });
+    res.json(updated);
+  });
+
+  app.post("/api/sessions", requireAuth, async (req, res) => {
+    try {
+      const user = await storage.getUser(req.session.userId!);
+      if (!user) {
+        return res.status(401).json({ message: "User not found" });
+      }
+
+      const reader = await storage.getReader(req.body.readerId);
+      if (!reader || !reader.isOnline) {
+        return res.status(400).json({ message: "Reader is not available" });
+      }
+
+      const ratePerMinute = Number(req.body.ratePerMinute);
+      const minimumBalance = ratePerMinute * 3;
+      if (Number(user.balance) < minimumBalance) {
+        return res.status(400).json({ message: "Insufficient balance" });
+      }
+
+      const session = await storage.createSession({
+        clientId: user.id,
+        readerId: reader.id,
+        type: req.body.type,
+        status: "active",
+        ratePerMinute: req.body.ratePerMinute,
+        startedAt: new Date(),
+      });
+
+      res.json(session);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to create session" });
+    }
+  });
+
+  app.get("/api/sessions/client", requireAuth, async (req, res) => {
+    const sessions = await storage.getSessionsByClient(req.session.userId!);
+    res.json(sessions);
+  });
+
+  app.get("/api/sessions/reader", requireAuth, async (req, res) => {
+    const reader = await storage.getReaderByUserId(req.session.userId!);
+    if (!reader) {
+      return res.status(404).json({ message: "Reader profile not found" });
+    }
+    const sessions = await storage.getSessionsByReader(reader.id);
+    res.json(sessions);
+  });
+
+  app.get("/api/sessions/:id/messages", requireAuth, async (req, res) => {
+    const messages = await storage.getMessagesBySession(req.params.id);
+    res.json(messages);
+  });
+
+  app.post("/api/sessions/:id/messages", requireAuth, async (req, res) => {
+    try {
+      const session = await storage.getSession(req.params.id);
+      if (!session) {
+        return res.status(404).json({ message: "Session not found" });
+      }
+
+      const user = await storage.getUser(req.session.userId!);
+      if (!user) {
+        return res.status(401).json({ message: "User not found" });
+      }
+
+      const reader = await storage.getReader(session.readerId);
+      if (!reader) {
+        return res.status(404).json({ message: "Reader not found" });
+      }
+
+      const receiverId = user.id === session.clientId ? reader.userId : session.clientId;
+
+      const message = await storage.createMessage({
+        senderId: user.id,
+        receiverId,
+        sessionId: session.id,
+        content: req.body.content,
+        isRead: false,
+        isPaid: false,
+      });
+
+      broadcastToSession(session.id, { type: "message", message });
+      res.json(message);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to send message" });
+    }
+  });
+
+  app.patch("/api/sessions/:id/end", requireAuth, async (req, res) => {
+    try {
+      const session = await storage.getSession(req.params.id);
+      if (!session) {
+        return res.status(404).json({ message: "Session not found" });
+      }
+
+      const endedAt = new Date();
+      const startedAt = session.startedAt ? new Date(session.startedAt) : new Date();
+      const durationMs = endedAt.getTime() - startedAt.getTime();
+      const durationMinutes = Math.ceil(durationMs / 60000);
+      
+      const ratePerMinute = Number(session.ratePerMinute);
+      const totalCost = durationMinutes * ratePerMinute;
+      const readerEarnings = totalCost * 0.7;
+      const platformFee = totalCost * 0.3;
+
+      const updated = await storage.updateSession(req.params.id, {
+        status: "completed",
+        endedAt,
+        duration: durationMinutes,
+        totalCost: totalCost.toFixed(2),
+        readerEarnings: readerEarnings.toFixed(2),
+        platformFee: platformFee.toFixed(2),
+      });
+
+      const client = await storage.getUser(session.clientId);
+      if (client) {
+        const newBalance = Number(client.balance) - totalCost;
+        await storage.updateUser(client.id, { balance: newBalance.toFixed(2) });
+        
+        await storage.createTransaction({
+          userId: client.id,
+          type: "session_charge",
+          amount: (-totalCost).toFixed(2),
+          description: `${session.type} reading session`,
+          referenceId: session.id,
+          referenceType: "session",
+        });
+      }
+
+      const reader = await storage.getReader(session.readerId);
+      if (reader) {
+        const newPending = Number(reader.pendingPayout) + readerEarnings;
+        const newTotal = Number(reader.totalEarnings) + readerEarnings;
+        await storage.updateReader(reader.id, {
+          pendingPayout: newPending.toFixed(2),
+          totalEarnings: newTotal.toFixed(2),
+          totalReadings: reader.totalReadings + 1,
+        });
+      }
+
+      res.json(updated);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to end session" });
+    }
+  });
+
+  app.get("/api/products", async (req, res) => {
+    const products = await storage.getAllProducts();
+    res.json(products);
+  });
+
+  app.get("/api/products/:id", async (req, res) => {
+    const product = await storage.getProduct(req.params.id);
+    if (!product) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+    res.json(product);
+  });
+
+  app.get("/api/messages/conversations", requireAuth, async (req, res) => {
+    const conversations = await storage.getConversations(req.session.userId!);
+    res.json(conversations);
+  });
+
+  app.get("/api/favorites", requireAuth, async (req, res) => {
+    const favorites = await storage.getFavoritesByClient(req.session.userId!);
+    res.json(favorites);
+  });
+
+  app.get("/api/favorites/check/:readerId", requireAuth, async (req, res) => {
+    const isFav = await storage.isFavorite(req.session.userId!, req.params.readerId);
+    res.json(isFav);
+  });
+
+  app.post("/api/favorites", requireAuth, async (req, res) => {
+    try {
+      const favorite = await storage.createFavorite({
+        clientId: req.session.userId!,
+        readerId: req.body.readerId,
+      });
+      res.json(favorite);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to add favorite" });
+    }
+  });
+
+  app.delete("/api/favorites/:readerId", requireAuth, async (req, res) => {
+    await storage.deleteFavorite(req.session.userId!, req.params.readerId);
+    res.json({ success: true });
+  });
+
+  app.get("/api/admin/users", requireAdmin, async (req, res) => {
+    const users = await storage.getAllUsers();
+    res.json(users.map(u => ({ ...u, password: undefined })));
+  });
+
+  app.get("/api/admin/readers", requireAdmin, async (req, res) => {
+    const readers = await storage.getAllReaders();
+    res.json(readers);
+  });
+
+  app.get("/api/admin/sessions", requireAdmin, async (req, res) => {
+    const sessions = await storage.getAllSessions();
+    res.json(sessions);
+  });
+
+  app.get("/api/admin/products", requireAdmin, async (req, res) => {
+    const products = await storage.getAllProducts();
+    res.json(products);
+  });
+
+  app.patch("/api/admin/readers/:id/approve", requireAdmin, async (req, res) => {
+    const updated = await storage.updateReader(req.params.id, { isApproved: true });
+    res.json(updated);
+  });
+
+  app.post("/api/admin/readers", requireAdmin, async (req, res) => {
+    try {
+      const readerData = insertReaderSchema.parse(req.body);
+      const reader = await storage.createReader(readerData);
+      
+      await storage.updateUser(readerData.userId, { role: "reader" });
+      
+      res.json(reader);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors[0].message });
+      }
+      res.status(500).json({ message: "Failed to create reader" });
+    }
+  });
 
   return httpServer;
 }

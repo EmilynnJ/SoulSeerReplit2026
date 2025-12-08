@@ -43,9 +43,11 @@
   --chart-3: 280 65% 52%;
   --chart-4: 200 70% 45%;
   --chart-5: 25 80% 50%;
-  --font-sans: Open Sans, sans-serif;
-  --font-serif: Georgia, serif;
+  --font-sans: "Playfair Display", serif;
+  --font-serif: "Playfair Display", serif;
   --font-mono: Menlo, monospace;
+  --gold: 45 93% 47%;
+  --gold-foreground: 45 10% 10%;
   --radius: .5rem;
   --shadow-2xs: 0px 2px 0px 0px hsl(270 8% 15% / 0.00);
   --shadow-xs: 0px 2px 0px 0px hsl(270 8% 15% / 0.00);
