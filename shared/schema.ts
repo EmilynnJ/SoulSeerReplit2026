@@ -36,6 +36,8 @@ export const readers = pgTable("readers", {
   pendingPayout: decimal("pending_payout", { precision: 10, scale: 2 }).notNull().default("0.00"),
   rating: decimal("rating", { precision: 3, scale: 2 }),
   reviewCount: integer("review_count").notNull().default(0),
+  stripeConnectAccountId: text("stripe_connect_account_id"),
+  stripeConnectOnboarded: boolean("stripe_connect_onboarded").notNull().default(false),
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 

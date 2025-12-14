@@ -9,7 +9,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { useAuth } from "@/lib/auth";
 import { useToast } from "@/hooks/use-toast";
 import { queryClient, apiRequest } from "@/lib/queryClient";
-import { Link } from "wouter";
+import { Link, useSearch } from "wouter";
 import { 
   Wallet, 
   MessageCircle, 
@@ -20,14 +20,19 @@ import {
   TrendingUp,
   Users,
   DollarSign,
-  Sparkles
+  Sparkles,
+  ExternalLink,
+  CheckCircle,
+  AlertCircle,
+  Banknote
 } from "lucide-react";
 import type { Session, Reader } from "@shared/schema";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
 export default function ReaderDashboard() {
   const { user, reader, refreshUser } = useAuth();
   const { toast } = useToast();
+  const searchString = useSearch();
   const [chatRate, setChatRate] = useState(reader?.chatRate || "3.99");
   const [voiceRate, setVoiceRate] = useState(reader?.voiceRate || "4.99");
   const [videoRate, setVideoRate] = useState(reader?.videoRate || "5.99");
@@ -36,6 +41,28 @@ export default function ReaderDashboard() {
     queryKey: ["/api/sessions/reader"],
     enabled: !!reader,
   });
+
+  const { data: connectStatus, refetch: refetchConnectStatus } = useQuery<{
+    onboarded: boolean;
+    accountId: string | null;
+    payoutsEnabled?: boolean;
+    detailsSubmitted?: boolean;
+  }>({
+    queryKey: ["/api/stripe/connect/status"],
+    enabled: !!reader,
+  });
+
+  useEffect(() => {
+    if (searchString.includes("connect=success")) {
+      refetchConnectStatus();
+      refreshUser();
+      toast({
+        title: "Stripe Connect Setup",
+        description: "Your payout account is being verified. This may take a few minutes.",
+      });
+      window.history.replaceState({}, "", "/reader-dashboard");
+    }
+  }, [searchString, refetchConnectStatus, refreshUser, toast]);
 
   const toggleOnlineMutation = useMutation({
     mutationFn: async () => {
@@ -68,6 +95,47 @@ export default function ReaderDashboard() {
       toast({
         title: "Rates updated",
         description: "Your per-minute rates have been saved",
+      });
+    },
+  });
+
+  const connectOnboardMutation = useMutation({
+    mutationFn: async (): Promise<{ url: string }> => {
+      const res = await apiRequest("POST", "/api/stripe/connect/onboard");
+      return res.json();
+    },
+    onSuccess: (data) => {
+      if (data.url) {
+        window.location.href = data.url;
+      }
+    },
+    onError: () => {
+      toast({
+        title: "Error",
+        description: "Failed to start payout setup. Please try again.",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const payoutMutation = useMutation({
+    mutationFn: async (): Promise<{ success: boolean; amount: string }> => {
+      const res = await apiRequest("POST", "/api/stripe/connect/payout");
+      return res.json();
+    },
+    onSuccess: (data) => {
+      refreshUser();
+      queryClient.invalidateQueries({ queryKey: ["/api/stripe/connect/status"] });
+      toast({
+        title: "Payout Successful",
+        description: `$${data.amount} has been sent to your bank account.`,
+      });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Payout Failed",
+        description: error.message || "Unable to process payout. Please try again.",
+        variant: "destructive",
       });
     },
   });
@@ -351,6 +419,65 @@ export default function ReaderDashboard() {
           </div>
 
           <div className="space-y-6">
+            <Card className="border-primary/20">
+              <CardHeader>
+                <CardTitle className="font-display text-2xl text-primary flex items-center gap-2">
+                  <Banknote className="h-5 w-5" />
+                  Payouts
+                </CardTitle>
+                <CardDescription>Withdraw your earnings to your bank account</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="p-4 rounded-lg bg-muted/30">
+                  <p className="text-sm text-muted-foreground">Available for payout</p>
+                  <p className="font-display text-2xl text-gold" data-testid="text-available-payout">
+                    ${Number(reader.pendingPayout).toFixed(2)}
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1">Minimum payout: $15.00</p>
+                </div>
+
+                {!connectStatus?.onboarded ? (
+                  <div className="space-y-3">
+                    <div className="flex items-start gap-2 p-3 rounded-lg bg-muted/50">
+                      <AlertCircle className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+                      <p className="text-sm text-muted-foreground">
+                        Set up your payout account to receive earnings directly to your bank.
+                      </p>
+                    </div>
+                    <Button
+                      className="w-full"
+                      onClick={() => connectOnboardMutation.mutate()}
+                      disabled={connectOnboardMutation.isPending}
+                      data-testid="button-setup-payouts"
+                    >
+                      {connectOnboardMutation.isPending ? "Loading..." : "Set Up Payouts"}
+                      <ExternalLink className="h-4 w-4 ml-2" />
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-sm text-green-600 dark:text-green-400">
+                      <CheckCircle className="h-4 w-4" />
+                      <span>Payout account connected</span>
+                    </div>
+                    <Button
+                      className="w-full"
+                      onClick={() => payoutMutation.mutate()}
+                      disabled={payoutMutation.isPending || Number(reader.pendingPayout) < 15}
+                      data-testid="button-request-payout"
+                    >
+                      {payoutMutation.isPending ? "Processing..." : "Request Payout"}
+                    </Button>
+                    {Number(reader.pendingPayout) < 15 && (
+                      <p className="text-xs text-muted-foreground text-center">
+                        Earn ${(15 - Number(reader.pendingPayout)).toFixed(2)} more to request payout
+                      </p>
+                    )}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
             <Card className="border-primary/20">
               <CardHeader>
                 <CardTitle className="font-display text-2xl text-primary">Your Profile</CardTitle>

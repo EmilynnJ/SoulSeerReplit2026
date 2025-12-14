@@ -666,5 +666,128 @@ export async function registerRoutes(
     }
   });
 
+  app.post("/api/stripe/connect/onboard", requireAuth, async (req, res) => {
+    try {
+      const reader = await storage.getReaderByUserId(req.session.userId!);
+      if (!reader) {
+        return res.status(404).json({ message: "Reader profile not found" });
+      }
+
+      const { getUncachableStripeClient } = await import("./stripeClient");
+      const stripe = await getUncachableStripeClient();
+
+      let accountId = reader.stripeConnectAccountId;
+
+      if (!accountId) {
+        const user = await storage.getUser(req.session.userId!);
+        const account = await stripe.accounts.create({
+          type: "express",
+          email: user?.email,
+          metadata: { readerId: reader.id },
+        });
+        accountId = account.id;
+        await storage.updateReader(reader.id, { stripeConnectAccountId: accountId });
+      }
+
+      const baseUrl = process.env.REPLIT_DEV_DOMAIN 
+        ? `https://${process.env.REPLIT_DEV_DOMAIN}` 
+        : `${req.protocol}://${req.get("host")}`;
+
+      const accountLink = await stripe.accountLinks.create({
+        account: accountId,
+        refresh_url: `${baseUrl}/reader-dashboard?connect=refresh`,
+        return_url: `${baseUrl}/reader-dashboard?connect=success`,
+        type: "account_onboarding",
+      });
+
+      res.json({ url: accountLink.url });
+    } catch (error) {
+      console.error("Error creating Connect onboarding:", error);
+      res.status(500).json({ message: "Failed to start onboarding" });
+    }
+  });
+
+  app.get("/api/stripe/connect/status", requireAuth, async (req, res) => {
+    try {
+      const reader = await storage.getReaderByUserId(req.session.userId!);
+      if (!reader) {
+        return res.status(404).json({ message: "Reader profile not found" });
+      }
+
+      if (!reader.stripeConnectAccountId) {
+        return res.json({ onboarded: false, accountId: null });
+      }
+
+      const { getUncachableStripeClient } = await import("./stripeClient");
+      const stripe = await getUncachableStripeClient();
+
+      const account = await stripe.accounts.retrieve(reader.stripeConnectAccountId);
+      const onboarded = account.details_submitted && account.payouts_enabled;
+
+      if (onboarded && !reader.stripeConnectOnboarded) {
+        await storage.updateReader(reader.id, { stripeConnectOnboarded: true });
+      }
+
+      res.json({ 
+        onboarded, 
+        accountId: reader.stripeConnectAccountId,
+        payoutsEnabled: account.payouts_enabled,
+        detailsSubmitted: account.details_submitted,
+      });
+    } catch (error) {
+      console.error("Error checking Connect status:", error);
+      res.status(500).json({ message: "Failed to check status" });
+    }
+  });
+
+  app.post("/api/stripe/connect/payout", requireAuth, async (req, res) => {
+    try {
+      const reader = await storage.getReaderByUserId(req.session.userId!);
+      if (!reader) {
+        return res.status(404).json({ message: "Reader profile not found" });
+      }
+
+      if (!reader.stripeConnectAccountId || !reader.stripeConnectOnboarded) {
+        return res.status(400).json({ message: "Please complete Stripe Connect setup first" });
+      }
+
+      const pendingAmount = Number(reader.pendingPayout);
+      if (pendingAmount < 15) {
+        return res.status(400).json({ message: "Minimum payout is $15" });
+      }
+
+      const { getUncachableStripeClient } = await import("./stripeClient");
+      const stripe = await getUncachableStripeClient();
+
+      const amountCents = Math.round(pendingAmount * 100);
+
+      const transfer = await stripe.transfers.create({
+        amount: amountCents,
+        currency: "usd",
+        destination: reader.stripeConnectAccountId,
+        metadata: { readerId: reader.id },
+      });
+
+      await storage.updateReader(reader.id, { pendingPayout: "0.00" });
+
+      const user = await storage.getUser(reader.userId);
+      if (user) {
+        await storage.createTransaction({
+          userId: user.id,
+          type: "payout",
+          amount: (-pendingAmount).toFixed(2),
+          description: "Reader payout via Stripe Connect",
+          referenceId: transfer.id,
+          referenceType: "stripe_transfer",
+        });
+      }
+
+      res.json({ success: true, amount: pendingAmount.toFixed(2), transferId: transfer.id });
+    } catch (error: any) {
+      console.error("Error processing payout:", error);
+      res.status(500).json({ message: error.message || "Failed to process payout" });
+    }
+  });
+
   return httpServer;
 }
