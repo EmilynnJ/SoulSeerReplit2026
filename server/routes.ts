@@ -56,17 +56,33 @@ export async function registerRoutes(
 
   wss.on("connection", (ws) => {
     let currentSessionId: string | null = null;
+    let currentUserId: string | null = null;
 
     ws.on("message", (data) => {
       try {
         const message = JSON.parse(data.toString());
         if (message.type === "join" && message.sessionId) {
           currentSessionId = message.sessionId;
+          currentUserId = message.userId || null;
           const sessionId = currentSessionId as string;
           if (!activeSessions.has(sessionId)) {
             activeSessions.set(sessionId, new Set());
           }
           activeSessions.get(sessionId)!.add(ws);
+        } else if (message.type === "typing" && currentSessionId) {
+          const clients = activeSessions.get(currentSessionId);
+          if (clients) {
+            const typingData = JSON.stringify({ 
+              type: "typing", 
+              userId: currentUserId,
+              isTyping: message.isTyping 
+            });
+            clients.forEach((client) => {
+              if (client !== ws && client.readyState === WebSocket.OPEN) {
+                client.send(typingData);
+              }
+            });
+          }
         }
       } catch (error) {
         console.error("WebSocket message error:", error);
@@ -75,8 +91,21 @@ export async function registerRoutes(
 
     ws.on("close", () => {
       if (currentSessionId && activeSessions.has(currentSessionId)) {
-        activeSessions.get(currentSessionId)!.delete(ws);
-        if (activeSessions.get(currentSessionId)!.size === 0) {
+        const clients = activeSessions.get(currentSessionId)!;
+        clients.delete(ws);
+        
+        const typingCleared = JSON.stringify({ 
+          type: "typing", 
+          userId: currentUserId,
+          isTyping: false 
+        });
+        clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(typingCleared);
+          }
+        });
+        
+        if (clients.size === 0) {
           activeSessions.delete(currentSessionId);
         }
       }
@@ -377,6 +406,13 @@ export async function registerRoutes(
           totalReadings: reader.totalReadings + 1,
         });
       }
+
+      broadcastToSession(session.id, { 
+        type: "session_ended", 
+        session: updated,
+        duration: durationMinutes,
+        totalCost: totalCost.toFixed(2),
+      });
 
       res.json(updated);
     } catch (error) {
