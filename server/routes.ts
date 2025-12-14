@@ -62,10 +62,11 @@ export async function registerRoutes(
         const message = JSON.parse(data.toString());
         if (message.type === "join" && message.sessionId) {
           currentSessionId = message.sessionId;
-          if (!activeSessions.has(currentSessionId)) {
-            activeSessions.set(currentSessionId, new Set());
+          const sessionId = currentSessionId as string;
+          if (!activeSessions.has(sessionId)) {
+            activeSessions.set(sessionId, new Set());
           }
-          activeSessions.get(currentSessionId)!.add(ws);
+          activeSessions.get(sessionId)!.add(ws);
         }
       } catch (error) {
         console.error("WebSocket message error:", error);
@@ -466,6 +467,154 @@ export async function registerRoutes(
         return res.status(400).json({ message: error.errors[0].message });
       }
       res.status(500).json({ message: "Failed to create reader" });
+    }
+  });
+
+  app.get("/api/stripe/publishable-key", async (req, res) => {
+    try {
+      const { getStripePublishableKey } = await import("./stripeClient");
+      const publishableKey = await getStripePublishableKey();
+      res.json({ publishableKey });
+    } catch (error) {
+      console.error("Error getting Stripe publishable key:", error);
+      res.status(500).json({ message: "Stripe not configured" });
+    }
+  });
+
+  app.post("/api/stripe/create-checkout-session", requireAuth, async (req, res) => {
+    try {
+      const amount = Number(req.body.amount);
+      
+      if (!amount || isNaN(amount) || amount < 5 || amount > 1000) {
+        return res.status(400).json({ message: "Deposit must be between $5 and $1000" });
+      }
+
+      const userId = req.session.userId;
+      if (!userId) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(401).json({ message: "User not found" });
+      }
+
+      const { getUncachableStripeClient } = await import("./stripeClient");
+      const stripe = await getUncachableStripeClient();
+
+      const baseUrl = process.env.REPLIT_DEV_DOMAIN 
+        ? `https://${process.env.REPLIT_DEV_DOMAIN}` 
+        : `${req.protocol}://${req.get("host")}`;
+
+      const amountCents = Math.round(amount * 100);
+
+      const session = await stripe.checkout.sessions.create({
+        payment_method_types: ["card"],
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              product_data: {
+                name: "SoulSeer Balance Deposit",
+                description: `Add $${amount.toFixed(2)} to your account balance`,
+              },
+              unit_amount: amountCents,
+            },
+            quantity: 1,
+          },
+        ],
+        mode: "payment",
+        success_url: `${baseUrl}/dashboard?deposit=success&amount=${amount.toFixed(2)}`,
+        cancel_url: `${baseUrl}/dashboard?deposit=cancelled`,
+        metadata: {
+          userId: user.id,
+          type: "balance_deposit",
+          amountCents: amountCents.toString(),
+        },
+      });
+
+      res.json({ sessionId: session.id, url: session.url });
+    } catch (error) {
+      console.error("Error creating checkout session:", error);
+      res.status(500).json({ message: "Failed to create checkout session" });
+    }
+  });
+
+  app.post("/api/stripe/webhook/:uuid", async (req, res) => {
+    try {
+      const signature = req.headers["stripe-signature"] as string;
+      const { uuid } = req.params;
+
+      if (!signature) {
+        return res.status(400).json({ message: "Missing Stripe signature" });
+      }
+
+      const rawBody = (req as any).rawBody;
+      if (!rawBody || !Buffer.isBuffer(rawBody)) {
+        console.error("Webhook error: rawBody is not a buffer");
+        return res.status(400).json({ message: "Invalid request body" });
+      }
+
+      const { WebhookHandlers } = await import("./webhookHandlers");
+      await WebhookHandlers.processWebhook(rawBody, signature, uuid);
+
+      res.json({ received: true });
+    } catch (error) {
+      console.error("Webhook error:", error);
+      res.status(400).json({ message: "Webhook processing failed" });
+    }
+  });
+
+  app.post("/api/stripe/confirm-deposit", requireAuth, async (req, res) => {
+    try {
+      const { sessionId } = req.body;
+      
+      if (!sessionId || typeof sessionId !== "string") {
+        return res.status(400).json({ message: "Valid session ID required" });
+      }
+
+      const { getUncachableStripeClient } = await import("./stripeClient");
+      const stripe = await getUncachableStripeClient();
+      
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      
+      if (session.payment_status !== "paid") {
+        return res.status(400).json({ message: "Payment not completed" });
+      }
+
+      const userId = session.metadata?.userId;
+      const amountCents = parseInt(session.metadata?.amountCents || "0", 10);
+      const amount = amountCents / 100;
+
+      if (!userId || userId !== req.session.userId) {
+        return res.status(403).json({ message: "Unauthorized" });
+      }
+
+      if (amountCents <= 0) {
+        return res.status(400).json({ message: "Invalid amount" });
+      }
+
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      const newBalance = Number(user.balance) + amount;
+      await storage.updateUser(userId, { balance: newBalance.toFixed(2) });
+
+      await storage.createTransaction({
+        userId,
+        type: "deposit",
+        amount: amount.toFixed(2),
+        description: `Balance deposit via Stripe`,
+        referenceId: session.id,
+        referenceType: "stripe_checkout",
+      });
+
+      res.json({ success: true, newBalance: newBalance.toFixed(2) });
+    } catch (error) {
+      console.error("Error confirming deposit:", error);
+      res.status(500).json({ message: "Failed to confirm deposit" });
     }
   });
 
