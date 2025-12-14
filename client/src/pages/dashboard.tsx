@@ -1,11 +1,17 @@
-import { useQuery } from "@tanstack/react-query";
-import { Link } from "wouter";
+import { useQuery, useMutation } from "@tanstack/react-query";
+import { Link, useLocation } from "wouter";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { useAuth } from "@/lib/auth";
+import { useToast } from "@/hooks/use-toast";
+import { apiRequest, queryClient } from "@/lib/queryClient";
+import { useState, useEffect } from "react";
 import { 
   Wallet, 
   MessageCircle, 
@@ -15,12 +21,73 @@ import {
   Plus,
   History,
   ShoppingBag,
-  Sparkles
+  Sparkles,
+  Loader2,
+  CreditCard
 } from "lucide-react";
 import type { Session, Reader, Favorite } from "@shared/schema";
 
 export default function Dashboard() {
-  const { user } = useAuth();
+  const { user, refreshUser } = useAuth();
+  const { toast } = useToast();
+  const [location] = useLocation();
+  const [depositDialogOpen, setDepositDialogOpen] = useState(false);
+  const [depositAmount, setDepositAmount] = useState("25");
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const depositStatus = params.get("deposit");
+    const amount = params.get("amount");
+    
+    if (depositStatus === "success" && amount) {
+      toast({
+        title: "Deposit Successful",
+        description: `$${amount} has been added to your balance.`,
+      });
+      refreshUser();
+      queryClient.invalidateQueries({ queryKey: ["/api/sessions/client"] });
+      window.history.replaceState({}, "", "/dashboard");
+    } else if (depositStatus === "cancelled") {
+      toast({
+        title: "Deposit Cancelled",
+        description: "Your deposit was cancelled.",
+        variant: "destructive",
+      });
+      window.history.replaceState({}, "", "/dashboard");
+    }
+  }, [location]);
+
+  const depositMutation = useMutation({
+    mutationFn: async (amount: number) => {
+      const response = await apiRequest("POST", "/api/stripe/create-checkout-session", { amount });
+      return response.json();
+    },
+    onSuccess: (data) => {
+      if (data.url) {
+        window.location.href = data.url;
+      }
+    },
+    onError: (error: Error) => {
+      toast({
+        title: "Error",
+        description: error.message || "Failed to start deposit",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const handleDeposit = () => {
+    const amount = parseFloat(depositAmount);
+    if (isNaN(amount) || amount < 5) {
+      toast({
+        title: "Invalid Amount",
+        description: "Minimum deposit is $5",
+        variant: "destructive",
+      });
+      return;
+    }
+    depositMutation.mutate(amount);
+  };
 
   const { data: sessions, isLoading: sessionsLoading } = useQuery<Session[]>({
     queryKey: ["/api/sessions/client"],
@@ -79,7 +146,12 @@ export default function Dashboard() {
                   <Wallet className="h-6 w-6 text-primary" />
                 </div>
               </div>
-              <Button className="w-full mt-4" size="sm" data-testid="button-add-funds">
+              <Button 
+                className="w-full mt-4" 
+                size="sm" 
+                data-testid="button-add-funds"
+                onClick={() => setDepositDialogOpen(true)}
+              >
                 <Plus className="h-4 w-4 mr-2" />
                 Add Funds
               </Button>
@@ -307,7 +379,7 @@ export default function Dashboard() {
                     <Heart className="h-10 w-10 mx-auto text-muted-foreground mb-2" />
                     <p className="text-sm text-muted-foreground">No favorites yet</p>
                     <Link href="/readers">
-                      <Button variant="link" size="sm" className="mt-2">
+                      <Button variant="ghost" size="sm" className="mt-2">
                         Browse Readers
                       </Button>
                     </Link>
@@ -333,6 +405,74 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+
+      <Dialog open={depositDialogOpen} onOpenChange={setDepositDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="font-display text-2xl text-primary flex items-center gap-2">
+              <CreditCard className="h-6 w-6" />
+              Add Funds
+            </DialogTitle>
+            <DialogDescription>
+              Add money to your SoulSeer balance to pay for readings.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <Label htmlFor="deposit-amount">Amount (USD)</Label>
+              <div className="relative">
+                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground">$</span>
+                <Input
+                  id="deposit-amount"
+                  type="number"
+                  min="5"
+                  step="5"
+                  value={depositAmount}
+                  onChange={(e) => setDepositAmount(e.target.value)}
+                  className="pl-8"
+                  data-testid="input-deposit-amount"
+                />
+              </div>
+              <p className="text-xs text-muted-foreground">Minimum deposit: $5</p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {[10, 25, 50, 100].map((amt) => (
+                <Button
+                  key={amt}
+                  variant={depositAmount === amt.toString() ? "default" : "outline"}
+                  size="sm"
+                  onClick={() => setDepositAmount(amt.toString())}
+                  data-testid={`button-preset-${amt}`}
+                >
+                  ${amt}
+                </Button>
+              ))}
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDepositDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button 
+              onClick={handleDeposit} 
+              disabled={depositMutation.isPending}
+              data-testid="button-confirm-deposit"
+            >
+              {depositMutation.isPending ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Processing...
+                </>
+              ) : (
+                <>
+                  <CreditCard className="h-4 w-4 mr-2" />
+                  Deposit ${depositAmount}
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
