@@ -33,8 +33,10 @@ export default function Session() {
   const [sessionActive, setSessionActive] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [currentCost, setCurrentCost] = useState(0);
+  const [isOtherTyping, setIsOtherTyping] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const sessionType = new URLSearchParams(window.location.search).get("type") || "chat";
 
@@ -119,13 +121,24 @@ export default function Session() {
     const socket = new WebSocket(wsUrl);
 
     socket.onopen = () => {
-      socket.send(JSON.stringify({ type: "join", sessionId: sId }));
+      socket.send(JSON.stringify({ type: "join", sessionId: sId, userId: user?.id }));
     };
 
     socket.onmessage = (event) => {
       const data = JSON.parse(event.data);
       if (data.type === "message") {
         refetchMessages();
+        setIsOtherTyping(false);
+      } else if (data.type === "session_ended") {
+        setSessionActive(false);
+        setIsOtherTyping(false);
+        queryClient.invalidateQueries({ queryKey: ["/api/sessions"] });
+        toast({
+          title: "Session ended",
+          description: `Total: ${data.duration} minutes - $${data.totalCost}`,
+        });
+      } else if (data.type === "typing") {
+        setIsOtherTyping(data.isTyping);
       }
     };
 
@@ -134,6 +147,27 @@ export default function Session() {
     };
 
     wsRef.current = socket;
+  };
+
+  const sendTypingIndicator = (isTyping: boolean) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "typing", isTyping }));
+    }
+  };
+
+  const handleMessageChange = (value: string) => {
+    setMessage(value);
+    if (value.length > 0) {
+      sendTypingIndicator(true);
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+      }
+      typingTimeoutRef.current = setTimeout(() => {
+        sendTypingIndicator(false);
+      }, 2000);
+    } else {
+      sendTypingIndicator(false);
+    }
   };
 
   useEffect(() => {
@@ -158,7 +192,13 @@ export default function Session() {
 
   useEffect(() => {
     return () => {
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+      }
       if (wsRef.current) {
+        if (wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: "typing", isTyping: false }));
+        }
         wsRef.current.close();
       }
     };
@@ -392,6 +432,17 @@ export default function Session() {
                     </div>
                   ))
                 )}
+                {isOtherTyping && (
+                  <div className="flex justify-start">
+                    <div className="bg-muted rounded-lg px-4 py-2">
+                      <div className="flex items-center gap-1">
+                        <span className="w-2 h-2 bg-muted-foreground/50 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+                        <span className="w-2 h-2 bg-muted-foreground/50 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+                        <span className="w-2 h-2 bg-muted-foreground/50 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                      </div>
+                    </div>
+                  </div>
+                )}
                 <div ref={messagesEndRef} />
               </div>
             </div>
@@ -409,7 +460,7 @@ export default function Session() {
                 >
                   <Textarea
                     value={message}
-                    onChange={(e) => setMessage(e.target.value)}
+                    onChange={(e) => handleMessageChange(e.target.value)}
                     placeholder="Type your message..."
                     className="resize-none min-h-[60px]"
                     onKeyDown={(e) => {
