@@ -2,6 +2,8 @@ import type { Express, Request, Response } from "express";
 import { createServer, type Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import session from "express-session";
+import connectPgSimple from "connect-pg-simple";
+import pg from "pg";
 import { storage } from "./storage";
 import { 
   insertUserSchema, insertReaderSchema, insertSessionSchema,
@@ -39,8 +41,18 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+  const PgStore = connectPgSimple(session);
+  const pool = new pg.Pool({
+    connectionString: process.env.DATABASE_URL,
+  });
+
   app.use(
     session({
+      store: new PgStore({
+        pool,
+        tableName: "user_sessions",
+        createTableIfMissing: true,
+      }),
       secret: process.env.SESSION_SECRET || "soulseer-secret-key-change-in-production",
       resave: false,
       saveUninitialized: false,
