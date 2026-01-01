@@ -226,6 +226,57 @@ export async function registerRoutes(
     res.json({ user: { ...user, password: undefined }, reader });
   });
 
+  // Production admin setup - only works when no admins exist
+  app.post("/api/setup/admin", async (req, res) => {
+    try {
+      // Check if any admin already exists
+      const existingAdmins = await storage.getUsersByRole("admin");
+      if (existingAdmins.length > 0) {
+        return res.status(403).json({ message: "Admin already exists" });
+      }
+
+      const { email, username, password, fullName } = req.body;
+      
+      if (!email || !username || !password || !fullName) {
+        return res.status(400).json({ message: "All fields are required" });
+      }
+
+      const existingEmail = await storage.getUserByEmail(email);
+      if (existingEmail) {
+        return res.status(400).json({ message: "Email already registered" });
+      }
+
+      const existingUsername = await storage.getUserByUsername(username);
+      if (existingUsername) {
+        return res.status(400).json({ message: "Username already taken" });
+      }
+
+      const hashedPassword = await hashPassword(password);
+      const user = await storage.createUser({
+        email,
+        username,
+        password: hashedPassword,
+        fullName,
+        role: "admin",
+      });
+
+      req.session.userId = user.id;
+      res.json({ user: { ...user, password: undefined }, message: "Admin created successfully" });
+    } catch (error) {
+      console.error("Admin setup error:", error);
+      res.status(500).json({ message: "Admin setup failed" });
+    }
+  });
+
+  // Check if setup is needed
+  app.get("/api/setup/status", async (req, res) => {
+    const existingAdmins = await storage.getUsersByRole("admin");
+    res.json({ 
+      setupRequired: existingAdmins.length === 0,
+      hasReaders: (await storage.getApprovedReaders()).length > 0
+    });
+  });
+
   app.get("/api/readers", async (req, res) => {
     const readers = await storage.getApprovedReaders();
     res.json(readers);
