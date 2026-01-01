@@ -20,6 +20,8 @@ import ReaderDashboard from "@/pages/reader-dashboard";
 import Session from "@/pages/session";
 import Messages from "@/pages/messages";
 import Admin from "@/pages/admin";
+import ProductPage from "@/pages/product";
+import OrderSuccess from "@/pages/order-success";
 
 function Router() {
   return (
@@ -37,6 +39,8 @@ function Router() {
       <Route path="/messages" component={Messages} />
       <Route path="/messages/:userId" component={Messages} />
       <Route path="/admin" component={Admin} />
+      <Route path="/product/:id" component={ProductPage} />
+      <Route path="/order-success" component={OrderSuccess} />
       <Route component={NotFound} />
     </Switch>
   );

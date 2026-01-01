@@ -840,5 +840,176 @@ export async function registerRoutes(
     }
   });
 
+  app.post("/api/stripe/checkout-product", requireAuth, async (req, res) => {
+    try {
+      const { productId } = req.body;
+      
+      if (!productId || typeof productId !== "string") {
+        return res.status(400).json({ message: "Product ID required" });
+      }
+
+      const userId = req.session.userId;
+      if (!userId) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const product = await storage.getProduct(productId);
+      if (!product || !product.isActive) {
+        return res.status(404).json({ message: "Product not found" });
+      }
+
+      if (product.readerId) {
+        const reader = await storage.getReader(product.readerId);
+        if (reader && reader.userId === userId) {
+          return res.status(400).json({ message: "You cannot purchase your own product" });
+        }
+      }
+
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(401).json({ message: "User not found" });
+      }
+
+      const { getUncachableStripeClient } = await import("./stripeClient");
+      const stripe = await getUncachableStripeClient();
+
+      const baseUrl = process.env.REPLIT_DEV_DOMAIN 
+        ? `https://${process.env.REPLIT_DEV_DOMAIN}` 
+        : `${req.protocol}://${req.get("host")}`;
+
+      const priceCents = Math.round(Number(product.price) * 100);
+
+      const session = await stripe.checkout.sessions.create({
+        payment_method_types: ["card"],
+        customer_email: user.email,
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              product_data: {
+                name: product.name,
+                description: product.description || undefined,
+                images: product.image ? [product.image] : undefined,
+              },
+              unit_amount: priceCents,
+            },
+            quantity: 1,
+          },
+        ],
+        mode: "payment",
+        client_reference_id: userId,
+        success_url: `${baseUrl}/order-success?session_id={CHECKOUT_SESSION_ID}&type=${product.type}`,
+        cancel_url: `${baseUrl}/product/${productId}?checkout=cancelled`,
+        metadata: {
+          userId: user.id,
+          userEmail: user.email,
+          productId: product.id,
+          readerId: product.readerId || "",
+          type: "product_purchase",
+          priceCents: priceCents.toString(),
+        },
+      });
+
+      res.json({ sessionId: session.id, url: session.url });
+    } catch (error) {
+      console.error("Error creating product checkout:", error);
+      res.status(500).json({ message: "Failed to create checkout session" });
+    }
+  });
+
+  app.post("/api/stripe/confirm-order", requireAuth, async (req, res) => {
+    try {
+      const { sessionId } = req.body;
+      
+      if (!sessionId || typeof sessionId !== "string") {
+        return res.status(400).json({ message: "Valid session ID required" });
+      }
+
+      const { getUncachableStripeClient } = await import("./stripeClient");
+      const stripe = await getUncachableStripeClient();
+      
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      
+      if (session.payment_status !== "paid") {
+        return res.status(400).json({ message: "Payment not completed" });
+      }
+
+      const userId = session.metadata?.userId;
+      const productId = session.metadata?.productId;
+      const priceCents = parseInt(session.metadata?.priceCents || "0", 10);
+
+      if (!userId || userId !== req.session.userId) {
+        return res.status(403).json({ message: "Unauthorized" });
+      }
+
+      if (!session.client_reference_id || session.client_reference_id !== userId) {
+        return res.status(403).json({ message: "Session does not belong to this user" });
+      }
+
+      const user = await storage.getUser(userId);
+      if (!user || session.customer_email !== user.email) {
+        return res.status(403).json({ message: "Email mismatch" });
+      }
+
+      if (session.metadata?.type !== "product_purchase") {
+        return res.status(400).json({ message: "Invalid session type" });
+      }
+
+      if (!productId || priceCents <= 0) {
+        return res.status(400).json({ message: "Invalid order data" });
+      }
+
+      const product = await storage.getProduct(productId);
+      if (!product) {
+        return res.status(404).json({ message: "Product not found" });
+      }
+
+      const paymentIntentId = session.payment_intent as string;
+      if (!paymentIntentId) {
+        return res.status(400).json({ message: "No payment intent found" });
+      }
+
+      const existingTransactions = await storage.getTransactionsByUser(userId);
+      const alreadyProcessed = existingTransactions.some(
+        (tx) => tx.referenceType === "stripe_product_purchase" && tx.referenceId === paymentIntentId
+      );
+
+      if (alreadyProcessed) {
+        return res.json({ success: true, message: "Order already processed" });
+      }
+
+      const order = await storage.createOrder({
+        clientId: userId,
+        productId,
+        quantity: 1,
+        totalPrice: (priceCents / 100).toFixed(2),
+        status: "completed",
+      });
+
+      await storage.createTransaction({
+        userId,
+        type: "purchase",
+        amount: (-priceCents / 100).toFixed(2),
+        description: `Purchased: ${product.name}`,
+        referenceId: paymentIntentId,
+        referenceType: "stripe_product_purchase",
+      });
+
+      if (product.readerId) {
+        const reader = await storage.getReader(product.readerId);
+        if (reader) {
+          const readerShare = (priceCents / 100) * 0.7;
+          const newPending = Number(reader.pendingPayout) + readerShare;
+          await storage.updateReader(reader.id, { pendingPayout: newPending.toFixed(2) });
+        }
+      }
+
+      res.json({ success: true, orderId: order.id });
+    } catch (error) {
+      console.error("Error confirming order:", error);
+      res.status(500).json({ message: "Failed to confirm order" });
+    }
+  });
+
   return httpServer;
 }
