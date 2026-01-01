@@ -1011,5 +1011,36 @@ export async function registerRoutes(
     }
   });
 
+  app.post("/api/ably/auth", requireAuth, async (req, res) => {
+    try {
+      const userId = req.session.userId;
+      if (!userId) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+
+      const ablyApiKey = process.env.ABLY_API_KEY;
+      if (!ablyApiKey) {
+        return res.status(500).json({ message: "Ably not configured" });
+      }
+
+      const Ably = await import("ably");
+      const ably = new Ably.Rest(ablyApiKey);
+      
+      const tokenRequest = await ably.auth.createTokenRequest({
+        clientId: userId,
+      });
+
+      res.json(tokenRequest);
+    } catch (error) {
+      console.error("Error creating Ably token:", error);
+      res.status(500).json({ message: "Failed to create auth token" });
+    }
+  });
+
+  app.get("/api/ably/status", (req, res) => {
+    const configured = !!process.env.ABLY_API_KEY;
+    res.json({ configured });
+  });
+
   return httpServer;
 }
